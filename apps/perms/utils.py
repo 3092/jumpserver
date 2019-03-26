@@ -1,181 +1,371 @@
 # coding: utf-8
 
 from __future__ import absolute_import, unicode_literals
-import collections
+import uuid
+from collections import defaultdict
+from django.utils import timezone
+from django.db.models import Q
+from django.core.cache import cache
+from django.conf import settings
 
-from common.utils import setattr_bulk, get_logger
-from .tasks import push_users
-from .hands import User, UserGroup, Asset, AssetGroup, SystemUser
+from common.utils import get_logger
+from common.tree import TreeNode
+from .models import AssetPermission
+from .hands import Node
 
 logger = get_logger(__file__)
 
 
-def get_user_group_granted_asset_groups(user_group):
-    """Return asset groups granted of the user group
+class GenerateTree:
+    def __init__(self):
+        """
+        nodes: {"node_instance": {
+            "asset_instance": set("system_user")
+        }
+        """
+        self.__all_nodes = list(Node.objects.all())
+        self.nodes = defaultdict(dict)
 
-    :param user_group: Instance of :class: ``UserGroup``
-    :return: {asset_group1: {system_user1, },
-              asset_group2: {system_user1, system_user2}}
-    """
-    asset_groups = {}
-    asset_permissions = user_group.asset_permissions.all()
+    def add_asset(self, asset, system_users):
+        nodes = asset.nodes.all()
+        self.add_nodes(nodes)
+        for node in nodes:
+            self.nodes[node][asset].update(system_users)
 
-    for asset_permission in asset_permissions:
-        if not asset_permission.is_valid:
-            continue
-        for asset_group in asset_permission.asset_groups.all():
-            if asset_group in asset_groups:
-                asset_groups[asset_group] |= set(asset_permission.system_users.all())
-            else:
-                asset_groups[asset_group] = set(asset_permission.system_users.all())
-    return asset_groups
+    def get_nodes(self):
+        for node in self.nodes:
+            assets = set(self.nodes.get(node).keys())
+            for n in self.nodes.keys():
+                if n.key.startswith(node.key + ':'):
+                    assets.update(set(self.nodes[n].keys()))
+            node.assets_amount = len(assets)
+        return self.nodes
 
-
-def get_user_group_granted_assets(user_group):
-    """Return assets granted of the user group
-
-    :param user_group: Instance of :class: ``UserGroup``
-    :return: {asset1: {system_user1, }, asset1: {system_user1, system_user2]}
-    """
-    assets = {}
-    asset_permissions = user_group.asset_permissions.all()
-
-    for asset_permission in asset_permissions:
-        if not asset_permission.is_valid:
-            continue
-        for asset in asset_permission.get_granted_assets():
-            if not asset.is_active:
-                continue
-            if asset in assets:
-                assets[asset] |= set(asset_permission.system_users.all())
-            else:
-                assets[asset] = set(asset_permission.system_users.all())
-    return assets
-
-
-def get_user_granted_assets_direct(user):
-    """Return assets granted of the user directly
-
-     :param user: Instance of :class: ``User``
-     :return: {asset1: {system_user1, system_user2}, asset2: {...}}
-    """
-    assets = {}
-    asset_permissions_direct = user.asset_permissions.all()
-
-    for asset_permission in asset_permissions_direct:
-        if not asset_permission.is_valid:
-            continue
-        for asset in asset_permission.get_granted_assets():
-            if not asset.is_active:
-                continue
-            if asset in assets:
-                assets[asset] |= set(asset_permission.system_users.all())
-            else:
-                setattr(asset, 'inherited', False)
-                assets[asset] = set(asset_permission.system_users.all())
-    return assets
-
-
-def get_user_granted_assets_inherit_from_user_groups(user):
-    """Return assets granted of the user inherit from user groups
-
-    :param user: Instance of :class: ``User``
-    :return: {asset1: {system_user1, system_user2}, asset2: {...}}
-    """
-    assets = {}
-    user_groups = user.groups.all()
-
-    for user_group in user_groups:
-        assets_inherited = get_user_group_granted_assets(user_group)
-        for asset in assets_inherited:
-            if not asset.is_active:
-                continue
-            if asset in assets:
-                assets[asset] |= assets_inherited[asset]
-            else:
-                setattr(asset, 'inherited', True)
-                assets[asset] = assets_inherited[asset]
-    return assets
-
-
-def get_user_granted_assets(user):
-    """Return assets granted of the user inherit from user groups
-
-    :param user: Instance of :class: ``User``
-    :return: {asset1: {system_user1, system_user2}, asset2: {...}}
-    """
-    assets_direct = get_user_granted_assets_direct(user)
-    assets_inherited = get_user_granted_assets_inherit_from_user_groups(user)
-    assets = assets_inherited
-
-    for asset in assets_direct:
-        if not asset.is_active:
-            continue
-        if asset in assets:
-            assets[asset] |= assets_direct[asset]
+    def add_node(self, node):
+        if node in self.nodes:
+            return
         else:
-            assets[asset] = assets_direct[asset]
+            self.nodes[node] = defaultdict(set)
+        if node.is_root():
+            return
+        for n in self.__all_nodes:
+            if n.key == node.parent_key:
+                self.add_node(n)
+                break
+
+    def add_nodes(self, nodes):
+        for node in nodes:
+            self.add_node(node)
+
+
+def get_user_permissions(user, include_group=True):
+    if include_group:
+        groups = user.groups.all()
+        arg = Q(users=user) | Q(user_groups__in=groups)
+    else:
+        arg = Q(users=user)
+    return AssetPermission.objects.all().valid().filter(arg)
+
+
+def get_user_group_permissions(user_group):
+    return AssetPermission.objects.all().valid().filter(
+        user_groups=user_group
+    )
+
+
+def get_asset_permissions(asset, include_node=True):
+    if include_node:
+        nodes = asset.get_all_nodes(flat=True)
+        arg = Q(assets=asset) | Q(nodes__in=nodes)
+    else:
+        arg = Q(assets=asset)
+    return AssetPermission.objects.all().valid().filter(arg)
+
+
+def get_node_permissions(node):
+    return AssetPermission.objects.all().valid().filter(nodes=node)
+
+
+def get_system_user_permissions(system_user):
+    return AssetPermission.objects.valid().all().filter(
+        system_users=system_user
+    )
+
+
+class AssetPermissionUtil:
+    get_permissions_map = {
+        "User": get_user_permissions,
+        "UserGroup": get_user_group_permissions,
+        "Asset": get_asset_permissions,
+        "Node": get_node_permissions,
+        "SystemUser": get_node_permissions,
+    }
+
+    CACHE_KEY = '_ASSET_PERM_CACHE_{}_{}'
+    CACHE_META_KEY = '_ASSET_PERM_META_KEY_{}'
+    CACHE_TIME = settings.ASSETS_PERM_CACHE_TIME
+    CACHE_POLICY_MAP = (('0', 'never'), ('1', 'using'), ('2', 'refresh'))
+
+    def __init__(self, obj, cache_policy='0'):
+        self.object = obj
+        self.obj_id = str(obj.id)
+        self._permissions = None
+        self._assets = None
+        self.cache_policy = cache_policy
+        self.node_key = self.CACHE_KEY.format(self.obj_id, 'NODES_WITH_ASSETS')
+        self.asset_key = self.CACHE_KEY.format(self.obj_id, 'ASSETS')
+        self.system_key = self.CACHE_KEY.format(self.obj_id, 'SYSTEM_USER')
+
+    @property
+    def permissions(self):
+        if self._permissions:
+            return self._permissions
+        object_cls = self.object.__class__.__name__
+        func = self.get_permissions_map[object_cls]
+        permissions = func(self.object)
+        self._permissions = permissions
+        return permissions
+
+    def filter_permission_with_system_user(self, system_user):
+        self._permissions = self.permissions.filter(system_users=system_user)
+
+    def get_nodes_direct(self):
+        """
+        返回用户/组授权规则直接关联的节点
+        :return: {node1: set(system_user1,)}
+        """
+        nodes = defaultdict(set)
+        permissions = self.permissions.prefetch_related('nodes', 'system_users')
+        for perm in permissions:
+            for node in perm.nodes.all():
+                nodes[node].update(perm.system_users.all())
+        return nodes
+
+    def get_assets_direct(self):
+        """
+        返回用户授权规则直接关联的资产
+        :return: {asset1: set(system_user1,)}
+        """
+        assets = defaultdict(set)
+        permissions = self.permissions.prefetch_related('assets', 'system_users')
+        for perm in permissions:
+            for asset in perm.assets.all().valid().prefetch_related('nodes'):
+                assets[asset].update(
+                    perm.system_users.filter(protocol=asset.protocol)
+                )
+        return assets
+
+    def get_assets_without_cache(self):
+        if self._assets:
+            return self._assets
+        assets = self.get_assets_direct()
+        nodes = self.get_nodes_direct()
+        for node, system_users in nodes.items():
+            _assets = node.get_all_assets().valid().prefetch_related('nodes')
+            for asset in _assets:
+                assets[asset].update(
+                    [s for s in system_users if s.protocol == asset.protocol]
+                )
+        self._assets = assets
+        return self._assets
+
+    def get_assets_from_cache(self):
+        cached = cache.get(self.asset_key)
+        if not cached:
+            self.update_cache()
+            cached = cache.get(self.asset_key)
+        return cached
+
+    def get_assets(self):
+        if self.CACHE_TIME <= 0 or self.cache_policy in self.CACHE_POLICY_MAP[1]:
+            return self.get_assets_from_cache()
+        elif self.cache_policy in self.CACHE_POLICY_MAP[2]:
+            self.expire_cache()
+            return self.get_assets_from_cache()
+        else:
+            self.expire_cache()
+            return self.get_assets_without_cache()
+
+    def get_nodes_with_assets_without_cache(self):
+        """
+        返回节点并且包含资产
+        {"node": {"assets": set("system_user")}}
+        :return:
+        """
+        assets = self.get_assets_without_cache()
+        tree = GenerateTree()
+        for asset, system_users in assets.items():
+            tree.add_asset(asset, system_users)
+        return tree.get_nodes()
+
+    def get_nodes_with_assets_from_cache(self):
+        cached = cache.get(self.node_key)
+        if not cached:
+            self.update_cache()
+            cached = cache.get(self.node_key)
+        return cached
+
+    def get_nodes_with_assets(self):
+        if self.CACHE_TIME <= 0 or self.cache_policy in self.CACHE_POLICY_MAP[1]:
+            return self.get_nodes_with_assets_from_cache()
+        elif self.cache_policy in self.CACHE_POLICY_MAP[2]:
+            self.expire_cache()
+            return self.get_nodes_with_assets_from_cache()
+        else:
+            return self.get_nodes_with_assets_without_cache()
+
+    def get_system_user_without_cache(self):
+        system_users = set()
+        permissions = self.permissions.prefetch_related('system_users')
+        for perm in permissions:
+            system_users.update(perm.system_users.all())
+        return system_users
+
+    def get_system_user_from_cache(self):
+        cached = cache.get(self.system_key)
+        if not cached:
+            self.update_cache()
+            cached = cache.get(self.system_key)
+        return cached
+
+    def get_system_users(self):
+        if self.CACHE_TIME <= 0 or self.cache_policy in self.CACHE_POLICY_MAP[1]:
+            return self.get_system_user_from_cache()
+        elif self.cache_policy in self.CACHE_POLICY_MAP[2]:
+            self.expire_cache()
+            return self.get_system_user_from_cache()
+        else:
+            return self.get_system_user_without_cache()
+
+    @property
+    def cache_meta(self):
+        key = self.CACHE_META_KEY.format(str(self.object.id))
+        return cache.get(key) or {}
+
+    def set_cache_meta(self):
+        key = self.CACHE_META_KEY.format(str(self.object.id))
+        meta = {
+            'id': str(uuid.uuid4()),
+            'datetime': timezone.now(),
+            'object': str(self.object)
+        }
+        cache.set(key, meta, self.CACHE_TIME)
+
+    def expire_cache_meta(self):
+        key = self.CACHE_META_KEY.format(str(self.object.id))
+        cache.delete(key)
+
+    def update_cache(self):
+        assets = self.get_assets_without_cache()
+        nodes = self.get_nodes_with_assets_without_cache()
+        system_users = self.get_system_user_without_cache()
+        cache.set(self.asset_key, assets, self.CACHE_TIME)
+        cache.set(self.node_key, nodes, self.CACHE_TIME)
+        cache.set(self.system_key, system_users, self.CACHE_TIME)
+        self.set_cache_meta()
+
+    def expire_cache(self):
+        """
+        因为 获取用户的节点，资产，系统用户等都能会缓存，这里会清理所有与该对象有关的
+        缓存，以免造成不统一的情况
+        :return:
+        """
+        key = self.CACHE_KEY.format(str(self.object.id), '*')
+        cache.delete_pattern(key)
+        self.expire_cache_meta()
+
+    def expire_all_cache_meta(self):
+        key = self.CACHE_META_KEY.format('*')
+        cache.delete_pattern(key)
+
+    @classmethod
+    def expire_all_cache(cls):
+        key = cls.CACHE_KEY.format('*', '*')
+        cache.delete_pattern(key)
+
+
+def is_obj_attr_has(obj, val, attrs=("hostname", "ip", "comment")):
+    if not attrs:
+        vals = [val for val in obj.__dict__.values() if isinstance(val, (str, int))]
+    else:
+        vals = [getattr(obj, attr) for attr in attrs if
+                hasattr(obj, attr) and isinstance(hasattr(obj, attr), (str, int))]
+
+    for v in vals:
+        if str(v).find(val) != -1:
+            return True
+    return False
+
+
+def sort_assets(assets, order_by='hostname', reverse=False):
+    if order_by == 'ip':
+        assets = sorted(assets, key=lambda asset: [int(d) for d in asset.ip.split('.') if d.isdigit()], reverse=reverse)
+    else:
+        assets = sorted(assets, key=lambda asset: getattr(asset, order_by), reverse=reverse)
     return assets
 
 
-def get_user_granted_asset_groups(user):
-    """Return asset groups with assets and system users, it's not the asset
-    group direct permed in rules. We get all asset and then get it asset group
-
-    :param user: Instance of :class: ``User``
-    :return: {asset_group1: [asset1, asset2], asset_group2: []}
-    """
-    asset_groups = collections.defaultdict(list)
-    ungroups = [AssetGroup(name="UnGrouped")]
-    for asset, system_users in get_user_granted_assets(user).items():
-        groups = asset.groups.all()
-        if not groups:
-            groups = ungroups
-        for asset_group in groups:
-            asset_groups[asset_group].append((asset, system_users))
-    return asset_groups
-
-
-def get_user_group_asset_permissions(user_group):
-    permissions = user_group.asset_permissions.all()
-    return permissions
+def parse_node_to_tree_node(node):
+    from . import serializers
+    name = '{} ({})'.format(node.value, node.assets_amount)
+    node_serializer = serializers.GrantedNodeSerializer(node)
+    data = {
+        'id': node.key,
+        'name': name,
+        'title': name,
+        'pId': node.parent_key,
+        'isParent': True,
+        'open': node.is_root(),
+        'meta': {
+            'node': node_serializer.data,
+            'type': 'node'
+        }
+    }
+    tree_node = TreeNode(**data)
+    return tree_node
 
 
-def get_user_asset_permissions(user):
-    user_group_permissions = set()
-    direct_permissions = set(setattr_bulk(user.asset_permissions.all(), 'inherited', 0))
-
-    for user_group in user.groups.all():
-        permissions = get_user_group_asset_permissions(user_group)
-        user_group_permissions |= set(permissions)
-    user_group_permissions = set(setattr_bulk(user_group_permissions, 'inherited', 1))
-    return direct_permissions | user_group_permissions
-
-
-def get_user_granted_system_users(user):
-    """
-    :param user: the user
-    :return: {"system_user": ["asset", "asset1"], "system_user": []}
-    """
-    assets = get_user_granted_assets(user)
-    system_users_dict = {}
-    for asset, system_users in assets.items():
-        for system_user in system_users:
-            if system_user in system_users_dict:
-                system_users_dict[system_user].append(asset)
-            else:
-                system_users_dict[system_user] = [asset]
-    return system_users_dict
-
-
-def push_system_user(assets, system_user):
-    logger.info('Push system user %s' % system_user.name)
-    for asset in assets:
-        logger.info('\tAsset: %s' % asset.ip)
-    if not assets:
-        return None
-
-    assets = [asset._to_secret_json() for asset in assets]
-    system_user = system_user._to_secret_json()
-    task = push_users.delay(assets, system_user)
-    return task.id
+def parse_asset_to_tree_node(node, asset, system_users):
+    system_users_protocol_matched = [s for s in system_users if s.protocol == asset.protocol]
+    icon_skin = 'file'
+    if asset.platform.lower() == 'windows':
+        icon_skin = 'windows'
+    elif asset.platform.lower() == 'linux':
+        icon_skin = 'linux'
+    system_users = []
+    for system_user in system_users_protocol_matched:
+        system_users.append({
+            'id': system_user.id,
+            'name': system_user.name,
+            'username': system_user.username,
+            'protocol': system_user.protocol,
+            'priority': system_user.priority,
+            'login_mode': system_user.login_mode,
+            'comment': system_user.comment,
+        })
+    data = {
+        'id': str(asset.id),
+        'name': asset.hostname,
+        'title': asset.ip,
+        'pId': node.key,
+        'isParent': False,
+        'open': False,
+        'iconSkin': icon_skin,
+        'meta': {
+            'system_users': system_users,
+            'type': 'asset',
+            'asset': {
+                'id': asset.id,
+                'hostname': asset.hostname,
+                'ip': asset.ip,
+                'port': asset.port,
+                'protocol': asset.protocol,
+                'platform': asset.platform,
+                'domain': None if not asset.domain else asset.domain.id,
+                'is_active': asset.is_active,
+                'comment': asset.comment
+            },
+        }
+    }
+    tree_node = TreeNode(**data)
+    return tree_node

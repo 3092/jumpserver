@@ -1,25 +1,46 @@
 from __future__ import unicode_literals
 
+import os
 import uuid
 
 from django.db import models
 from django.utils.translation import ugettext_lazy as _
+from django.utils import timezone
+from django.conf import settings
+from django.core.files.storage import default_storage
+from django.core.cache import cache
 
 from users.models import User
+from orgs.mixins import OrgModelMixin
+from common.utils import get_command_storage_setting, get_replay_storage_setting
+from .backends import get_multi_command_storage
 from .backends.command.models import AbstractSessionCommand
 
 
 class Terminal(models.Model):
     id = models.UUIDField(default=uuid.uuid4, primary_key=True)
     name = models.CharField(max_length=32, verbose_name=_('Name'))
-    remote_addr = models.CharField(max_length=128, verbose_name=_('Remote Address'))
+    remote_addr = models.CharField(max_length=128, blank=True, verbose_name=_('Remote Address'))
     ssh_port = models.IntegerField(verbose_name=_('SSH Port'), default=2222)
     http_port = models.IntegerField(verbose_name=_('HTTP Port'), default=5000)
+    command_storage = models.CharField(max_length=128, verbose_name=_("Command storage"), default='default')
+    replay_storage = models.CharField(max_length=128, verbose_name=_("Replay storage"), default='default')
     user = models.OneToOneField(User, related_name='terminal', verbose_name='Application User', null=True, on_delete=models.CASCADE)
     is_accepted = models.BooleanField(default=False, verbose_name='Is Accepted')
     is_deleted = models.BooleanField(default=False)
     date_created = models.DateTimeField(auto_now_add=True)
     comment = models.TextField(blank=True, verbose_name=_('Comment'))
+    STATUS_KEY_PREFIX = 'terminal_status_'
+
+    @property
+    def is_alive(self):
+        key = self.STATUS_KEY_PREFIX + str(self.id)
+        return bool(cache.get(key))
+
+    @is_alive.setter
+    def is_alive(self, value):
+        key = self.STATUS_KEY_PREFIX + str(self.id)
+        cache.set(key, value, 60)
 
     @property
     def is_active(self):
@@ -33,9 +54,45 @@ class Terminal(models.Model):
             self.user.is_active = active
             self.user.save()
 
+    def get_command_storage_setting(self):
+        storage_all = get_command_storage_setting()
+        if self.command_storage in storage_all:
+            storage = storage_all.get(self.command_storage)
+        else:
+            storage = storage_all.get('default')
+        return {"TERMINAL_COMMAND_STORAGE": storage}
+
+    def get_replay_storage_setting(self):
+        storage_all = get_replay_storage_setting()
+        if self.replay_storage in storage_all:
+            storage = storage_all.get(self.replay_storage)
+        else:
+            storage = storage_all.get('default')
+        return {"TERMINAL_REPLAY_STORAGE": storage}
+
+    @property
+    def config(self):
+        configs = {}
+        for k in dir(settings):
+            if not k.startswith('TERMINAL'):
+                continue
+            configs[k] = getattr(settings, k)
+        configs.update(self.get_command_storage_setting())
+        configs.update(self.get_replay_storage_setting())
+        configs.update({
+            'SECURITY_MAX_IDLE_TIME': settings.SECURITY_MAX_IDLE_TIME
+        })
+        return configs
+
+    @property
+    def service_account(self):
+        return self.user
+
     def create_app_user(self):
         random = uuid.uuid4().hex[:6]
-        user, access_key = User.create_app_user(name="{}-{}".format(self.name, random), comment=self.comment)
+        user, access_key = User.create_app_user(
+            name="{}-{}".format(self.name, random), comment=self.comment
+        )
         self.user = user
         self.save()
         return user, access_key
@@ -82,10 +139,15 @@ class Status(models.Model):
         return self.date_created.strftime("%Y-%m-%d %H:%M:%S")
 
 
-class Session(models.Model):
+class Session(OrgModelMixin):
     LOGIN_FROM_CHOICES = (
         ('ST', 'SSH Terminal'),
         ('WT', 'Web Terminal'),
+    )
+    PROTOCOL_CHOICES = (
+        ('ssh', 'ssh'),
+        ('rdp', 'rdp'),
+        ('vnc', 'vnc')
     )
 
     id = models.UUIDField(default=uuid.uuid4, primary_key=True)
@@ -97,9 +159,70 @@ class Session(models.Model):
     is_finished = models.BooleanField(default=False)
     has_replay = models.BooleanField(default=False, verbose_name=_("Replay"))
     has_command = models.BooleanField(default=False, verbose_name=_("Command"))
-    terminal = models.ForeignKey(Terminal, null=True, on_delete=models.CASCADE)
-    date_start = models.DateTimeField(verbose_name=_("Date start"))
+    terminal = models.ForeignKey(Terminal, null=True, on_delete=models.SET_NULL)
+    protocol = models.CharField(choices=PROTOCOL_CHOICES, default='ssh', max_length=8)
+    date_last_active = models.DateTimeField(verbose_name=_("Date last active"), default=timezone.now)
+    date_start = models.DateTimeField(verbose_name=_("Date start"), db_index=True, default=timezone.now)
     date_end = models.DateTimeField(verbose_name=_("Date end"), null=True)
+
+    upload_to = 'replay'
+    ACTIVE_CACHE_KEY_PREFIX = 'SESSION_ACTIVE_{}'
+
+    def get_rel_replay_path(self, version=2):
+        """
+        获取session日志的文件路径
+        :param version: 原来后缀是 .gz，为了统一新版本改为 .replay.gz
+        :return:
+        """
+        suffix = '.replay.gz'
+        if version == 1:
+            suffix = '.gz'
+        date = self.date_start.strftime('%Y-%m-%d')
+        return os.path.join(date, str(self.id) + suffix)
+
+    def get_local_path(self, version=2):
+        rel_path = self.get_rel_replay_path(version=version)
+        if version == 2:
+            local_path = os.path.join(self.upload_to, rel_path)
+        else:
+            local_path = rel_path
+        return local_path
+
+    def can_replay(self):
+        if self.has_replay:
+            return True
+        version = settings.VERSION.split('.')
+        if [int(i) for i in version] > [1, 4, 8]:
+            return False
+        return True
+
+    def save_to_storage(self, f):
+        local_path = self.get_local_path()
+        try:
+            name = default_storage.save(local_path, f)
+            return name, None
+        except OSError as e:
+            return None, e
+
+    @classmethod
+    def set_sessions_active(cls, sessions_id):
+        data = {cls.ACTIVE_CACHE_KEY_PREFIX.format(i): i for i in sessions_id}
+        cache.set_many(data, timeout=5*60)
+
+    @classmethod
+    def get_active_sessions(cls):
+        return cls.objects.filter(is_finished=False)
+
+    def is_active(self):
+        if self.protocol in ['ssh', 'telnet']:
+            key = self.ACTIVE_CACHE_KEY_PREFIX.format(self.id)
+            return bool(cache.get(key))
+        return True
+
+    @property
+    def command_amount(self):
+        command_store = get_multi_command_storage()
+        return command_store.count(session=str(self.id))
 
     class Meta:
         db_table = "terminal_session"
@@ -117,7 +240,7 @@ class Task(models.Model):
     id = models.UUIDField(default=uuid.uuid4, primary_key=True)
     name = models.CharField(max_length=128, choices=NAME_CHOICES, verbose_name=_("Name"))
     args = models.CharField(max_length=1024, verbose_name=_("Args"))
-    terminal = models.ForeignKey(Terminal, null=True, on_delete=models.CASCADE)
+    terminal = models.ForeignKey(Terminal, null=True, on_delete=models.SET_NULL)
     is_finished = models.BooleanField(default=False)
     date_created = models.DateTimeField(auto_now_add=True)
     date_finished = models.DateTimeField(null=True)

@@ -1,71 +1,157 @@
 # ~*~ coding: utf-8 ~*~
 
 from django import forms
-from django.contrib.auth.forms import AuthenticationForm
 from django.utils.translation import gettext_lazy as _
-from captcha.fields import CaptchaField
 
 from common.utils import validate_ssh_public_key
-from perms.models import AssetPermission
+from orgs.mixins import OrgModelForm
+from orgs.utils import current_org
 from .models import User, UserGroup
 
 
-class UserLoginForm(AuthenticationForm):
+class UserCheckPasswordForm(forms.Form):
     username = forms.CharField(label=_('Username'), max_length=100)
     password = forms.CharField(
         label=_('Password'), widget=forms.PasswordInput,
         max_length=128, strip=False
     )
-    captcha = CaptchaField()
 
 
-class UserCreateUpdateForm(forms.ModelForm):
+class UserCheckOtpCodeForm(forms.Form):
+    otp_code = forms.CharField(label=_('MFA code'), max_length=6)
+
+
+class UserCreateUpdateForm(OrgModelForm):
+    role_choices = ((i, n) for i, n in User.ROLE_CHOICES if i != User.ROLE_APP)
     password = forms.CharField(
         label=_('Password'), widget=forms.PasswordInput,
         max_length=128, strip=False, required=False,
+    )
+    role = forms.ChoiceField(
+        choices=role_choices, required=True,
+        initial=User.ROLE_USER, label=_("Role")
+    )
+    public_key = forms.CharField(
+        label=_('ssh public key'), max_length=5000, required=False,
+        widget=forms.Textarea(attrs={'placeholder': _('ssh-rsa AAAA...')}),
+        help_text=_('Paste user id_rsa.pub here.')
     )
 
     class Meta:
         model = User
         fields = [
             'username', 'name', 'email', 'groups', 'wechat',
-            'phone', 'role', 'date_expired', 'comment',
+            'phone', 'role', 'date_expired', 'comment', 'otp_level'
         ]
-        help_texts = {
-            'username': '* required',
-            'name': '* required',
-            'email': '* required',
-        }
         widgets = {
+            'otp_level': forms.RadioSelect(),
             'groups': forms.SelectMultiple(
                 attrs={
                     'class': 'select2',
                     'data-placeholder': _('Join user groups')
                 }
-            ),
+            )
         }
+
+    def __init__(self, *args, **kwargs):
+        self.request = kwargs.pop("request", None)
+        super(UserCreateUpdateForm, self).__init__(*args, **kwargs)
+
+        roles = []
+        # Super admin user
+        if self.request.user.is_superuser:
+            roles.append((User.ROLE_ADMIN, dict(User.ROLE_CHOICES).get(User.ROLE_ADMIN)))
+            roles.append((User.ROLE_USER, dict(User.ROLE_CHOICES).get(User.ROLE_USER)))
+
+        # Org admin user
+        else:
+            user = kwargs.get('instance')
+            # Update
+            if user:
+                role = kwargs.get('instance').role
+                roles.append((role, dict(User.ROLE_CHOICES).get(role)))
+            # Create
+            else:
+                roles.append((User.ROLE_USER, dict(User.ROLE_CHOICES).get(User.ROLE_USER)))
+
+        field = self.fields['role']
+        field.choices = set(roles)
+
+    def clean_public_key(self):
+        public_key = self.cleaned_data['public_key']
+        if not public_key:
+            return public_key
+        if self.instance.public_key and public_key == self.instance.public_key:
+            msg = _('Public key should not be the same as your old one.')
+            raise forms.ValidationError(msg)
+
+        if not validate_ssh_public_key(public_key):
+            raise forms.ValidationError(_('Not a valid ssh public key'))
+        return public_key
 
     def save(self, commit=True):
         password = self.cleaned_data.get('password')
+        otp_level = self.cleaned_data.get('otp_level')
+        public_key = self.cleaned_data.get('public_key')
         user = super().save(commit=commit)
         if password:
-            user.set_password(password)
+            user.reset_password(password)
+        if otp_level:
+            user.otp_level = otp_level
+            user.save()
+        if public_key:
+            user.public_key = public_key
             user.save()
         return user
 
 
 class UserProfileForm(forms.ModelForm):
+    username = forms.CharField(disabled=True)
+    name = forms.CharField(disabled=True)
+    email = forms.CharField(disabled=True)
+
     class Meta:
         model = User
         fields = [
             'username', 'name', 'email',
             'wechat', 'phone',
         ]
+
+
+UserProfileForm.verbose_name = _("Profile")
+
+
+class UserMFAForm(forms.ModelForm):
+
+    mfa_description = _(
+        'Tip: when enabled, '
+        'you will enter the MFA binding process the next time you log in. '
+        'you can also directly bind in '
+        '"personal information -> quick modification -> change MFA Settings"!')
+
+    class Meta:
+        model = User
+        fields = ['otp_level']
+        widgets = {'otp_level': forms.RadioSelect()}
         help_texts = {
-            'username': '* required',
-            'name': '* required',
-            'email': '* required',
+            'otp_level': _('* Enable MFA authentication '
+                           'to make the account more secure.'),
         }
+
+
+UserMFAForm.verbose_name = _("MFA")
+
+
+class UserFirstLoginFinishForm(forms.Form):
+    finish_description = _(
+        'In order to protect you and your company, '
+        'please keep your account, '
+        'password and key sensitive information properly. '
+        '(for example: setting complex password, enabling MFA authentication)'
+    )
+
+
+UserFirstLoginFinishForm.verbose_name = _("Finish")
 
 
 class UserPasswordForm(forms.Form):
@@ -104,14 +190,14 @@ class UserPasswordForm(forms.Form):
 
     def save(self):
         password = self.cleaned_data['new_password']
-        self.instance.set_password(password)
-        self.instance.save()
+        self.instance.reset_password(new_password=password)
         return self.instance
 
 
 class UserPublicKeyForm(forms.Form):
+    pubkey_description = _('Automatically configure and download the SSH key')
     public_key = forms.CharField(
-        label=_('ssh public key'), max_length=5000,
+        label=_('ssh public key'), max_length=5000, required=False,
         widget=forms.Textarea(attrs={'placeholder': _('ssh-rsa AAAA...')}),
         help_text=_('Paste your id_rsa.pub here.')
     )
@@ -129,21 +215,24 @@ class UserPublicKeyForm(forms.Form):
             msg = _('Public key should not be the same as your old one.')
             raise forms.ValidationError(msg)
 
-        if not validate_ssh_public_key(public_key):
+        if public_key and not validate_ssh_public_key(public_key):
             raise forms.ValidationError(_('Not a valid ssh public key'))
         return public_key
 
     def save(self):
         public_key = self.cleaned_data['public_key']
-        self.instance.public_key = public_key
-        self.instance.save()
+        if public_key:
+            self.instance.public_key = public_key
+            self.instance.save()
         return self.instance
 
 
-class UserBulkUpdateForm(forms.ModelForm):
+UserPublicKeyForm.verbose_name = _("Public key")
+
+
+class UserBulkUpdateForm(OrgModelForm):
     users = forms.ModelMultipleChoiceField(
         required=True,
-        help_text='* required',
         label=_('Select users'),
         queryset=User.objects.all(),
         widget=forms.SelectMultiple(
@@ -156,12 +245,12 @@ class UserBulkUpdateForm(forms.ModelForm):
 
     class Meta:
         model = User
-        fields = ['users', 'role', 'groups', 'date_expired']
+        fields = ['users', 'groups', 'date_expired']
         widgets = {
             "groups": forms.SelectMultiple(
                 attrs={
                     'class': 'select2',
-                    'data-placeholder': _('Select users')
+                    'data-placeholder': _('User group')
                 }
             )
         }
@@ -172,7 +261,6 @@ class UserBulkUpdateForm(forms.ModelForm):
             if self.data.get(field) is not None:
                 changed_fields.append(field)
 
-        print(changed_fields)
         cleaned_data = {k: v for k, v in self.cleaned_data.items()
                         if k in changed_fields}
         users = cleaned_data.pop('users', '')
@@ -185,9 +273,13 @@ class UserBulkUpdateForm(forms.ModelForm):
         return users
 
 
-class UserGroupForm(forms.ModelForm):
+def user_limit_to():
+    return {"orgs": current_org}
+
+
+class UserGroupForm(OrgModelForm):
     users = forms.ModelMultipleChoiceField(
-        queryset=User.objects.exclude(role=User.ROLE_APP),
+        queryset=User.objects.all(),
         label=_("User"),
         widget=forms.SelectMultiple(
             attrs={
@@ -196,17 +288,21 @@ class UserGroupForm(forms.ModelForm):
             }
         ),
         required=False,
+        limit_choices_to=user_limit_to
     )
 
     def __init__(self, **kwargs):
         instance = kwargs.get('instance')
         if instance:
             initial = kwargs.get('initial', {})
-            initial.update({
-                'users': instance.users.all(),
-            })
+            initial.update({'users': instance.users.all()})
             kwargs['initial'] = initial
         super().__init__(**kwargs)
+        if 'initial' not in kwargs:
+            return
+        users_field = self.fields.get('users')
+        if hasattr(users_field, 'queryset'):
+            users_field.queryset = current_org.get_org_users()
 
     def save(self, commit=True):
         group = super().save(commit=commit)
@@ -217,37 +313,8 @@ class UserGroupForm(forms.ModelForm):
     class Meta:
         model = UserGroup
         fields = [
-            'name', 'users', 'comment'
+            'name', 'users', 'comment',
         ]
-        help_texts = {
-            'name': '* required'
-        }
-
-
-class UserGroupPrivateAssetPermissionForm(forms.ModelForm):
-    def save(self, commit=True):
-        self.instance = super(UserGroupPrivateAssetPermissionForm, self)\
-            .save(commit=commit)
-        self.instance.user_groups = [self.user_group]
-        self.instance.save()
-        return self.instance
-
-    class Meta:
-        model = AssetPermission
-        fields = [
-            'assets', 'asset_groups', 'system_users', 'name',
-        ]
-        widgets = {
-            'assets': forms.SelectMultiple(
-                attrs={'class': 'select2',
-                       'data-placeholder': _('Select assets')}),
-            'asset_groups': forms.SelectMultiple(
-                attrs={'class': 'select2',
-                       'data-placeholder': _('Select asset groups')}),
-            'system_users': forms.SelectMultiple(
-                attrs={'class': 'select2',
-                       'data-placeholder': _('Select system users')}),
-        }
 
 
 class FileForm(forms.Form):

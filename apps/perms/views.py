@@ -3,24 +3,19 @@
 from __future__ import unicode_literals, absolute_import
 
 from django.utils.translation import ugettext as _
-from django.conf import settings
-from django.views.generic import ListView, CreateView, UpdateView
-from django.views.generic.edit import DeleteView, FormView
+from django.views.generic import ListView, CreateView, UpdateView, DetailView, TemplateView
+from django.views.generic.edit import DeleteView, SingleObjectMixin
 from django.urls import reverse_lazy
-from django.contrib.messages.views import SuccessMessageMixin
-from django.views.generic.detail import DetailView, SingleObjectMixin
-from django.contrib import messages
+from django.conf import settings
 
-from common.const import create_success_msg, update_success_msg
-from .hands import AdminUserRequiredMixin, User, UserGroup, SystemUser, \
-    Asset, AssetGroup
+from common.permissions import AdminUserRequiredMixin
+from orgs.utils import current_org
+from .hands import Node, Asset, SystemUser, User, UserGroup
 from .models import AssetPermission
 from .forms import AssetPermissionForm
 
 
-class AssetPermissionListView(AdminUserRequiredMixin, ListView):
-    model = AssetPermission
-    context_object_name = 'asset_permission_list'
+class AssetPermissionListView(AdminUserRequiredMixin, TemplateView):
     template_name = 'perms/asset_permission_list.html'
 
     def get_context_data(self, **kwargs):
@@ -32,12 +27,26 @@ class AssetPermissionListView(AdminUserRequiredMixin, ListView):
         return super().get_context_data(**kwargs)
 
 
-class AssetPermissionCreateView(AdminUserRequiredMixin, SuccessMessageMixin, CreateView):
+class AssetPermissionCreateView(AdminUserRequiredMixin, CreateView):
     model = AssetPermission
     form_class = AssetPermissionForm
     template_name = 'perms/asset_permission_create_update.html'
     success_url = reverse_lazy('perms:asset-permission-list')
-    success_message = create_success_msg
+
+    def get_form(self, form_class=None):
+        form = super().get_form(form_class=form_class)
+        nodes_id = self.request.GET.get("nodes")
+        assets_id = self.request.GET.get("assets")
+
+        if nodes_id:
+            nodes_id = nodes_id.split(",")
+            nodes = Node.objects.filter(id__in=nodes_id).exclude(id=Node.root().id)
+            form['nodes'].initial = nodes
+        if assets_id:
+            assets_id = assets_id.split(",")
+            assets = Asset.objects.filter(id__in=assets_id)
+            form['assets'].initial = assets
+        return form
 
     def get_context_data(self, **kwargs):
         context = {
@@ -48,12 +57,11 @@ class AssetPermissionCreateView(AdminUserRequiredMixin, SuccessMessageMixin, Cre
         return super().get_context_data(**kwargs)
 
 
-class AssetPermissionUpdateView(AdminUserRequiredMixin, SuccessMessageMixin, UpdateView):
+class AssetPermissionUpdateView(AdminUserRequiredMixin, UpdateView):
     model = AssetPermission
     form_class = AssetPermissionForm
     template_name = 'perms/asset_permission_create_update.html'
     success_url = reverse_lazy("perms:asset-permission-list")
-    success_message = update_success_msg
 
     def get_context_data(self, **kwargs):
         context = {
@@ -65,18 +73,18 @@ class AssetPermissionUpdateView(AdminUserRequiredMixin, SuccessMessageMixin, Upd
 
 
 class AssetPermissionDetailView(AdminUserRequiredMixin, DetailView):
-    template_name = 'perms/asset_permission_detail.html'
-    context_object_name = 'asset_permission'
     model = AssetPermission
+    form_class = AssetPermissionForm
+    template_name = 'perms/asset_permission_detail.html'
+    success_url = reverse_lazy("perms:asset-permission-list")
 
     def get_context_data(self, **kwargs):
         context = {
             'app': _('Perms'),
-            'action': _('Asset permission detail'),
-            'system_users_remain': [
-                system_user for system_user in SystemUser.objects.all()
-                if system_user not in self.object.system_users.all()],
-            'system_users': self.object.system_users.all(),
+            'action': _('Update asset permission'),
+            'system_users_remain': SystemUser.objects.exclude(
+                granted_by_permissions=self.object
+            ),
         }
         kwargs.update(context)
         return super().get_context_data(**kwargs)
@@ -101,18 +109,20 @@ class AssetPermissionUserView(AdminUserRequiredMixin,
         return super().get(request, *args, **kwargs)
 
     def get_queryset(self):
-        queryset = self.object.get_granted_users()
+        queryset = list(self.object.get_all_users())
         return queryset
 
     def get_context_data(self, **kwargs):
-        users_granted = self.get_queryset()
-        groups_granted = self.object.user_groups.all()
+
         context = {
             'app': _('Perms'),
             'action': _('Asset permission user list'),
-            'users_remain': User.objects.exclude(id__in=[user.id for user in users_granted]),
-            'user_groups': self.object.user_groups.all(),
-            'user_groups_remain': UserGroup.objects.exclude(id__in=[group.id for group in groups_granted])
+            'users_remain': current_org.get_org_users().exclude(
+                asset_permissions=self.object
+            ),
+            'user_groups_remain': UserGroup.objects.exclude(
+                asset_permissions=self.object
+            )
         }
         kwargs.update(context)
         return super().get_context_data(**kwargs)
@@ -127,22 +137,20 @@ class AssetPermissionAssetView(AdminUserRequiredMixin,
     object = None
 
     def get(self, request, *args, **kwargs):
-        self.object = self.get_object(queryset=AssetPermission.objects.all())
+        self.object = self.get_object(queryset = AssetPermission.objects.all())
         return super().get(request, *args, **kwargs)
 
     def get_queryset(self):
-        queryset = self.object.get_granted_assets()
+        queryset = list(self.object.get_all_assets())
         return queryset
 
     def get_context_data(self, **kwargs):
         assets_granted = self.get_queryset()
-        groups_granted = self.object.asset_groups.all()
         context = {
             'app': _('Perms'),
             'action': _('Asset permission asset list'),
-            'assets_remain': Asset.objects.exclude(id__in=[asset.id for asset in assets_granted]),
-            'asset_groups': self.object.asset_groups.all(),
-            'asset_groups_remain': AssetGroup.objects.exclude(id__in=[group.id for group in groups_granted])
+            'assets_remain': Asset.objects.exclude(id__in=[a.id for a in assets_granted]),
+            'nodes_remain': Node.objects.exclude(granted_by_permissions=self.object),
         }
         kwargs.update(context)
         return super().get_context_data(**kwargs)

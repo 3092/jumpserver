@@ -62,7 +62,6 @@ function GetTableDataBox() {
          }
         }
     for (i in id_list) {
-        console.log(tabProduct);
         tableData.push(GetRowData(tabProduct.rows[id_list[i]]));
     }
 
@@ -146,18 +145,111 @@ function activeNav() {
     var resource = url_array[2];
     if (app === ''){
         $('#index').addClass('active');
-    } else {
+    }
+    else if (app === 'xpack' && resource === 'cloud') {
+        var item = url_array[3];
+        $("#" + app).addClass('active');
+        $('#' + app + ' #' + resource).addClass('active');
+        $('#' + app + ' #' + resource + ' #' + item + ' a').css('color', '#ffffff');
+    }
+    else if (app === 'settings'){
+        $("#" + app).addClass('active');
+    }
+    else {
         $("#" + app).addClass('active');
         $('#' + app + ' #' + resource).addClass('active');
     }
 }
 
+function formSubmit(props) {
+    /*
+    {
+      "form": $("form"),
+      "url": "",
+      "method": "POST",
+      "redirect_to": "",
+      "success": function(data, textStatue, jqXHR){},
+      "error": function(jqXHR, textStatus, errorThrown) {}
+    }
+    */
+    props = props || {};
+    var data = props.data || props.form.serializeObject();
+    var redirect_to = props.redirect_to;
+    $.ajax({
+        url: props.url,
+        type: props.method || 'POST',
+        data: JSON.stringify(data),
+        contentType: props.content_type || "application/json; charset=utf-8",
+        dataType: props.data_type || "json"
+    }).done(function (data, textState, jqXHR) {
+        if (redirect_to) {
+            location.href = redirect_to;
+        } else if (typeof props.success === 'function') {
+            return props.success(data, textState, jqXHR);
+        }
+    }).fail(function(jqXHR, textStatus, errorThrown) {
+        if (typeof props.error === 'function') {
+            return props.error(jqXHR, textStatus, errorThrown)
+        }
+        if (!props.form) {
+            alert(jqXHR.responseText);
+            return
+        }
+        if (jqXHR.status === 400) {
+            var errors = jqXHR.responseJSON;
+            var noneFieldErrorRef = props.form.children('.alert-danger');
+            if (noneFieldErrorRef.length !== 1) {
+                props.form.prepend('<div class="alert alert-danger" style="display: none"></div>');
+                noneFieldErrorRef = props.form.children('.alert-danger');
+            }
+            var noneFieldErrorMsg = "";
+            noneFieldErrorRef.css("display", "none");
+            noneFieldErrorRef.html("");
+            props.form.find(".help-block.error").html("");
+            props.form.find(".form-group.has-error").removeClass("has-error");
+
+            if (typeof errors !== "object") {
+                noneFieldErrorMsg = errors;
+                if (noneFieldErrorRef.length === 1) {
+                    noneFieldErrorRef.css('display', 'block');
+                    noneFieldErrorRef.html(noneFieldErrorMsg);
+                }
+                return
+            }
+            $.each(errors, function (k, v) {
+                var fieldRef = props.form.find('input[name="' + k + '"]');
+                var formGroupRef = fieldRef.parents('.form-group');
+                var parentRef = fieldRef.parent();
+                var helpBlockRef = parentRef.children('.help-block.error');
+                if (helpBlockRef.length === 0) {
+                    parentRef.append('<div class="help-block error"></div>');
+                    helpBlockRef = parentRef.children('.help-block.error');
+                }
+                if (fieldRef.length === 1 && formGroupRef.length === 1) {
+                    formGroupRef.addClass('has-error');
+                    var help_msg = v.join("<br/>") ;
+                    helpBlockRef.html(help_msg);
+                } else {
+                    noneFieldErrorMsg += v + '<br/>';
+                }
+            });
+            if (noneFieldErrorRef.length === 1 && noneFieldErrorMsg !== '') {
+                noneFieldErrorRef.css('display', 'block');
+                noneFieldErrorRef.html(noneFieldErrorMsg);
+            }
+        }
+
+    })
+}
+
 function APIUpdateAttr(props) {
     // props = {url: .., body: , success: , error: , method: ,}
     props = props || {};
-    var success_message = props.success_message || '更新成功!';
-    var fail_message = props.fail_message || '更新时发生未知错误.';
-    var flash_message = true;
+    var user_success_message = props.success_message;
+    var default_success_message = gettext('Update is successful!');
+    var user_fail_message = props.fail_message;
+    var default_failed_message = gettext('An unknown error occurred while updating..');
+    var flash_message = props.flash_message || true;
     if (props.flash_message === false){
         flash_message = false;
     }
@@ -170,18 +262,38 @@ function APIUpdateAttr(props) {
         dataType: props.data_type || "json"
     }).done(function(data, textStatue, jqXHR) {
         if (flash_message) {
-            toastr.success(success_message);
+            var msg = "";
+            if (user_fail_message) {
+                msg = user_success_message;
+            } else {
+                msg = default_success_message;
+            }
+            toastr.success(msg);
         }
         if (typeof props.success === 'function') {
             return props.success(data);
-        } 
+        }
     }).fail(function(jqXHR, textStatus, errorThrown) {
         if (flash_message) {
-            toastr.error(fail_message);
+            var msg = "";
+            if (user_fail_message) {
+                msg = user_fail_message;
+            } else if (jqXHR.responseJSON) {
+                if (jqXHR.responseJSON.error) {
+                    msg = jqXHR.responseJSON.error
+                } else if (jqXHR.responseJSON.msg) {
+                    msg = jqXHR.responseJSON.msg
+                }
+            }
+            if (msg === "") {
+                msg = default_failed_message;
+            }
+            toastr.error(msg);
         }
         if (typeof props.error === 'function') {
-            return props.error(jqXHR.responseText);
-        } 
+            console.log(jqXHR);
+            return props.error(jqXHR.responseText, jqXHR.status);
+        }
     });
   // return true;
 }
@@ -199,27 +311,70 @@ function objectDelete(obj, name, url, redirectTo) {
             }
         };
         var fail = function() {
-            swal("错误", "删除"+"[ "+name+" ]"+"遇到错误", "error");
+            // swal("错误", "删除"+"[ "+name+" ]"+"遇到错误", "error");
+            swal(gettext('Error'), "[ "+name+" ]" + gettext("Being used by the asset, please unbind the asset first."), "error");
         };
         APIUpdateAttr({
             url: url,
             body: JSON.stringify(body),
             method: 'DELETE',
+            success_message: gettext("Delete the success"),
             success: success,
             error: fail
         });
     }
     swal({
-        title: '你确定删除吗 ?',
+        title: gettext('Are you sure about deleting it?'),
         text: " [" + name + "] ",
         type: "warning",
         showCancelButton: true,
-        cancelButtonText: '取消',
+        cancelButtonText: gettext('Cancel'),
         confirmButtonColor: "#ed5565",
-        confirmButtonText: '确认',
+        confirmButtonText: gettext('Confirm'),
         closeOnConfirm: true,
     }, function () {
-        doDelete()       
+        doDelete()
+    });
+}
+
+function orgDelete(obj, name, url, redirectTo){
+    function doDelete() {
+        var body = {};
+        var success = function() {
+            if (!redirectTo) {
+                $(obj).parent().parent().remove();
+            } else {
+                window.location.href=redirectTo;
+            }
+        };
+        var fail = function(responseText, status) {
+            if (status === 400){
+                swal(gettext("Error"),  "[ " + name + " ] " + gettext("The organization contains undeleted information. Please try again after deleting"), "error");
+            }
+            else if (status === 405){
+                swal(gettext("Error"), " [ "+ name + " ] " + gettext("Do not perform this operation under this organization. Try again after switching to another organization"), "error");
+            }
+        };
+        APIUpdateAttr({
+            url: url,
+            body: JSON.stringify(body),
+            method: 'DELETE',
+            success_message: gettext("Delete the success"),
+            success: success,
+            error: fail
+        });
+    }
+    swal({
+        title: gettext("Please ensure that the following information in the organization has been deleted"),
+        text: gettext("User list、User group、Asset list、Domain list、Admin user、System user、Labels、Asset permission"),
+        type: "warning",
+        showCancelButton: true,
+        cancelButtonText: gettext('Cancel'),
+        confirmButtonColor: "#ed5565",
+        confirmButtonText: gettext('Confirm'),
+        closeOnConfirm: true
+    }, function () {
+        doDelete();
     });
 }
 
@@ -239,9 +394,38 @@ $.fn.serializeObject = function()
     });
     return o;
 };
+
+function makeLabel(data) {
+    return "<label class='detail-key'><b>" + data[0] + ": </b></label>" + data[1] + "</br>"
+}
+
+
+
 var jumpserver = {};
 jumpserver.checked = false;
 jumpserver.selected = {};
+jumpserver.language = {
+    processing: gettext('Loading ...'),
+    search: gettext('Search'),
+    select: {
+        rows: {
+            _:  gettext("Selected item %d"),
+            0: ""
+        }
+    },
+    lengthMenu: gettext("Per page _MENU_"),
+    info: gettext('Displays the results of items _START_ to _END_; A total of _TOTAL_ entries'),
+    infoFiltered: "",
+    infoEmpty: "",
+    zeroRecords: gettext("No match"),
+    emptyTable: gettext('No record'),
+    paginate: {
+        first: "«",
+        previous: "‹",
+        next: "›",
+        last: "»"
+    }
+};
 jumpserver.initDataTable = function (options) {
   // options = {
   //    ele *: $('#dataTable_id'),
@@ -265,7 +449,7 @@ jumpserver.initDataTable = function (options) {
               $(td).html('<input type="checkbox" class="text-center ipt_check" id=99991937>'.replace('99991937', cellData));
           }
       },
-      {className: 'text-center', targets: '_all'}
+      {className: 'text-center', render: $.fn.dataTable.render.text(), targets: '_all'}
   ];
   columnDefs = options.columnDefs ? options.columnDefs.concat(columnDefs) : columnDefs;
   var select = {
@@ -280,27 +464,13 @@ jumpserver.initDataTable = function (options) {
         buttons: [],
         columnDefs: columnDefs,
         ajax: {
-            url: options.ajax_url ,
+            url: options.ajax_url,
             dataSrc: ""
         },
         columns: options.columns || [],
         select: options.select || select,
-        language: {
-            search: "搜索",
-            lengthMenu: "每页  _MENU_",
-            info: "显示第 _START_ 至 _END_ 项结果; 总共 _TOTAL_ 项",
-            infoFiltered:   "",
-            infoEmpty:      "",
-            zeroRecords:    "没有匹配项",
-            emptyTable:     "没有记录",
-            paginate: {
-                first:      "«",
-                previous:   "‹",
-                next:       "›",
-                last:       "»"
-            }
-        },
-        lengthMenu: [[15, 25, 50, -1], [15, 25, 50, "All"]]
+        language: jumpserver.language,
+        lengthMenu: [[10, 15, 25, 50, -1], [10, 15, 25, 50, "All"]]
     });
     table.on('select', function(e, dt, type, indexes) {
         var $node = table[ type ]( indexes ).nodes().to$();
@@ -310,13 +480,18 @@ jumpserver.initDataTable = function (options) {
         var $node = table[ type ]( indexes ).nodes().to$();
         $node.find('input.ipt_check').prop('checked', false);
         jumpserver.selected[$node.find('input.ipt_check').prop('id')] = false
-    }).
-    on('draw', function(){
+    }).on('draw', function(){
         $('#op').html(options.op_html || '');
         $('#uc').html(options.uc_html || '');
+        $('[data-toggle="popover"]').popover({
+            html: true,
+            placement: 'bottom',
+            // trigger: 'hover',
+            container: 'body'
+        });
     });
     $('.ipt_check_all').on('click', function() {
-      if (!jumpserver.checked) {
+      if ($(this).prop("checked")) {
           $(this).closest('table').find('.ipt_check').prop('checked', true);
           jumpserver.checked = true;
           table.rows({search:'applied', page:'current'}).select();
@@ -328,6 +503,16 @@ jumpserver.initDataTable = function (options) {
     });
 
     return table;
+};
+
+jumpserver.initStaticTable = function (selector) {
+    $(selector).DataTable({
+        "searching": false,
+        "bInfo": false,
+        "paging": false,
+        "order": [],
+        "language": jumpserver.language
+    });
 };
 
 jumpserver.initServerSideDataTable = function (options) {
@@ -362,18 +547,28 @@ jumpserver.initServerSideDataTable = function (options) {
       };
   var table = ele.DataTable({
         pageLength: options.pageLength || 15,
-        dom: options.dom || '<"#uc.pull-left">flt<"row m-t"<"col-md-8"<"#op.col-md-6"><"col-md-6 text-center"i>><"col-md-4"p>>',
+        dom: options.dom || '<"#uc.pull-left">fltr<"row m-t"<"col-md-8"<"#op.col-md-6"><"col-md-6 text-center"i>><"col-md-4"p>>',
         order: options.order || [],
-        // select: options.select || 'multi',
         buttons: [],
         columnDefs: columnDefs,
         serverSide: true,
         processing: true,
         ajax: {
             url: options.ajax_url ,
+            error: function(jqXHR, textStatus, errorThrown) {
+                var msg = gettext("Unknown error occur");
+                if (jqXHR.responseJSON) {
+                    if (jqXHR.responseJSON.error) {
+                        msg = jqXHR.responseJSON.error
+                    } else if (jqXHR.responseJSON.msg) {
+                        msg = jqXHR.responseJSON.msg
+                    }
+                }
+                alert(msg)
+            },
             data: function (data) {
                 delete data.columns;
-                if (data.length !== null ){
+                if (data.length !== null){
                     data.limit = data.length;
                     delete data.length;
                 }
@@ -383,12 +578,27 @@ jumpserver.initServerSideDataTable = function (options) {
                 }
                 if (data.search !== null) {
                     var search_val = data.search.value;
-                    data.search = search_val;
+                    var search_list = search_val.split(" ");
+                    var search_attr = {};
+                    var search_raw = [];
+
+                    search_list.map(function (val, index) {
+                       var kv = val.split(":");
+                       if (kv.length === 2) {
+                           search_attr[kv[0]] = kv[1]
+                       } else {
+                           search_raw.push(kv)
+                       }
+                    });
+                    data.search = search_raw.join("");
+                    $.each(search_attr, function (k, v) {
+                        data[k] = v
+                    })
                 }
                 if (data.order !== null && data.order.length === 1) {
                     var col = data.order[0].column;
                     var order = options.columns[col].data;
-                    if (data.order[0].dir = "desc") {
+                    if (data.order[0].dir === "desc") {
                         order = "-" + order;
                     }
                     data.order = order;
@@ -404,48 +614,68 @@ jumpserver.initServerSideDataTable = function (options) {
         },
         columns: options.columns || [],
         select: options.select || select,
-        language: {
-            search: "搜索",
-            lengthMenu: "每页  _MENU_",
-            info: "显示第 _START_ 至 _END_ 项结果; 总共 _TOTAL_ 项",
-            infoFiltered:   "",
-            infoEmpty:      "",
-            zeroRecords:    "没有匹配项",
-            emptyTable:     "没有记录",
-            paginate: {
-                first:      "«",
-                previous:   "‹",
-                next:       "›",
-                last:       "»"
-            }
-        },
-        lengthMenu: [[15, 25, 50], [15, 25, 50]]
+        language: jumpserver.language,
+        lengthMenu: [[15, 25, 50, 9999], [15, 25, 50, 'All']]
     });
+    table.selected = [];
+    table.selected_rows = [];
     table.on('select', function(e, dt, type, indexes) {
         var $node = table[ type ]( indexes ).nodes().to$();
         $node.find('input.ipt_check').prop('checked', true);
-        jumpserver.selected[$node.find('input.ipt_check').prop('id')] = true
+        jumpserver.selected[$node.find('input.ipt_check').prop('id')] = true;
+        if (type === 'row') {
+            var rows = table.rows(indexes).data();
+            $.each(rows, function (id, row) {
+                table.selected_rows.push(row);
+                if (row.id && $.inArray(row.id, table.selected) === -1){
+                    table.selected.push(row.id)
+                }
+            })
+        }
     }).on('deselect', function(e, dt, type, indexes) {
         var $node = table[ type ]( indexes ).nodes().to$();
         $node.find('input.ipt_check').prop('checked', false);
-        jumpserver.selected[$node.find('input.ipt_check').prop('id')] = false
-    }).
-    on('draw', function(){
+        jumpserver.selected[$node.find('input.ipt_check').prop('id')] = false;
+        if (type === 'row') {
+            var rows = table.rows(indexes).data();
+            $.each(rows, function (id, row) {
+                if (row.id){
+                    var index = table.selected.indexOf(row.id);
+                    if (index > -1){
+                        table.selected.splice(index, 1)
+                    }
+                }
+            })
+        }
+    }).on('draw', function(){
         $('#op').html(options.op_html || '');
         $('#uc').html(options.uc_html || '');
+        var table_data = [];
+        $.each(table.rows().data(), function (id, row) {
+            if (row.id) {
+                table_data.push(row.id)
+            }
+        });
+
+        $.each(table.selected, function (id, data) {
+            var index = table_data.indexOf(data);
+            if (index > -1){
+                table.rows(index).select()
+            }
+        });
     });
-    $('.ipt_check_all').on('click', function() {
-      if (!jumpserver.checked) {
-          $(this).closest('table').find('.ipt_check').prop('checked', true);
-          jumpserver.checked = true;
-          table.rows({search:'applied', page:'current'}).select();
-      } else {
-          $(this).closest('table').find('.ipt_check').prop('checked', false);
-          jumpserver.checked = false;
-          table.rows({search:'applied', page:'current'}).deselect();
-      }
+    var table_id = table.settings()[0].sTableId;
+    $('#' + table_id + ' .ipt_check_all').on('click', function() {
+        if ($(this).prop("checked")) {
+            $(this).closest('table').find('.ipt_check').prop('checked', true);
+            table.rows({search:'applied', page:'current'}).select();
+        } else {
+            $(this).closest('table').find('.ipt_check').prop('checked', false);
+            table.rows({search:'applied', page:'current'}).deselect();
+        }
     });
 
+    // jumpserver.table = table;
     return table;
 };
 
@@ -495,4 +725,224 @@ function delCookie(key) {
     if (val !== null) {
         document.cookie = key + '=' + val + ";expires" + expires.toUTCString() + ';path=/';
     }
+}
+
+function createPopover(dataset, title, callback) {
+    if (callback !== undefined){
+        var new_dataset = [];
+        $.each(dataset, function (index, value) {
+            new_dataset.push(callback(value))
+        });
+        dataset = new_dataset;
+    }
+    var data_content = dataset.join("</br>");
+
+    var html = "<a data-toggle='popover' data-content='" + data_content + "'>" + dataset.length + "</a>";
+    return html;
+}
+
+
+ $(function () {
+    (function ($) {
+        $.getUrlParam = function (name) {
+            var reg = new RegExp("(^|&)" + name + "=([^&]*)(&|$)");
+            var r = window.location.search.substr(1).match(reg);
+            if (r != null) return unescape(r[2]); return null;
+        }
+    })(jQuery);
+});
+
+function getUrlParam(name) {
+    var reg = new RegExp("(^|&)" + name + "=([^&]*)(&|$)");
+    var r = window.location.search.substr(1).match(reg);
+    if (r != null) return unescape(r[2]); return null;
+}
+
+function setUrlParam(url, name, value) {
+    var urlArray = url.split("?");
+    if (urlArray.length===1){
+        url += "?" + name + "=" + value;
+    } else {
+        var oriParam = urlArray[1].split("&");
+        var oriParamMap = {};
+        $.each(oriParam, function (index, value) {
+            var v = value.split("=");
+            oriParamMap[v[0]] = v[1];
+        });
+        oriParamMap[name] = value;
+        url = urlArray[0] + "?";
+        var newParam = [];
+        $.each(oriParamMap, function (index, value) {
+            newParam.push(index + "=" + value);
+        });
+        url += newParam.join("&")
+    }
+    return url
+}
+
+// Password check rules
+var rules_short_map_id = {
+    'min': 'id_security_password_min_length',
+    'upper': 'id_security_password_upper_case',
+    'lower': 'id_security_password_lower_case',
+    'number': 'id_security_password_number',
+    'special': 'id_security_password_special_char'
+};
+
+var rules_id_map_label = {
+    'id_security_password_min_length': gettext('Password minimum length {N} bits'),
+    'id_security_password_upper_case': gettext('Must contain capital letters'),
+    'id_security_password_lower_case': gettext('Must contain lowercase letters'),
+    'id_security_password_number': gettext('Must contain numeric characters'),
+    'id_security_password_special_char': gettext('Must contain special characters')
+};
+
+function getRuleLabel(rule){
+    var label = '';
+    if (rule.key === rules_short_map_id['min']){
+        label = rules_id_map_label[rule.key].replace('{N}', rule.value)
+    }
+    else{
+        label = rules_id_map_label[rule.key]
+    }
+    return label
+}
+
+// 校验密码-改变规则颜色
+function checkPasswordRules(password, minLength) {
+    if (wordMinLength(password, minLength)) {
+        $('#'+rules_short_map_id['min']).css('color', 'green')
+    }
+    else {
+        $('#'+rules_short_map_id['min']).css('color', '#908a8a')
+    }
+
+    if (wordUpperCase(password)) {
+        $('#'+rules_short_map_id['upper']).css('color', 'green')
+    }
+    else {
+        $('#'+rules_short_map_id['upper']).css('color', '#908a8a')
+    }
+
+    if (wordLowerCase(password)) {
+        $('#'+rules_short_map_id['lower']).css('color', 'green')
+    }
+    else {
+        $('#'+rules_short_map_id['lower']).css('color', '#908a8a')
+    }
+
+    if (wordNumber(password)) {
+        $('#'+rules_short_map_id['number']).css('color', 'green')
+    }
+    else {
+        $('#'+rules_short_map_id['number']).css('color', '#908a8a')
+    }
+
+    if (wordSpecialChar(password)) {
+        $('#'+rules_short_map_id['special']).css('color', 'green')
+    }
+    else {
+        $('#'+rules_short_map_id['special']).css('color', '#908a8a')
+    }
+}
+
+// 最小长度
+function wordMinLength(word, minLength) {
+    //var minLength = {{ min_length }};
+    var re = new RegExp("^(.{" + minLength + ",})$");
+    return word.match(re)
+}
+// 大写字母
+function wordUpperCase(word) {
+    return word.match(/([A-Z]+)/)
+}
+// 小写字母
+function wordLowerCase(word) {
+    return word.match(/([a-z]+)/)
+}
+// 数字字符
+function wordNumber(word) {
+    return word.match(/([\d]+)/)
+}
+// 特殊字符
+function wordSpecialChar(word) {
+    return word.match(/[`,~,!,@,#,\$,%,\^,&,\*,\(,\),\-,_,=,\+,\{,\},\[,\],\|,\\,;,',:,",\,,\.,<,>,\/,\?]+/)
+}
+
+
+// 显示弹窗密码规则
+function popoverPasswordRules(password_check_rules, $el) {
+    var message = "";
+    jQuery.each(password_check_rules, function (idx, rule) {
+        message += "<li id=" + rule.key + " style='list-style-type:none;'> <i class='fa fa-check-circle-o' style='margin-right:10px;' ></i>" + getRuleLabel(rule) + "</li>";
+    });
+    //$('#id_password_rules').html(message);
+    $el.html(message)
+}
+
+// 初始化弹窗popover
+function initPopover($container, $progress, $idPassword, $el, password_check_rules, i18n_fallback){
+    options = {};
+    // User Interface
+    options.ui = {
+        container: $container,
+        viewports: {
+            progress: $progress
+            //errors: $('.popover-content')
+        },
+        showProgressbar: true,
+        showVerdictsInsideProgressBar: true
+    };
+    options.i18n = {
+        fallback: i18n_fallback,
+        t: function (key) {
+            var result = '';
+            result = options.i18n.fallback[key];
+            return result === key ? '' : result;
+        }
+    };
+    $idPassword.pwstrength(options);
+    popoverPasswordRules(password_check_rules, $el);
+}
+
+// 解决input框中的资产和弹出表格中资产的显示不一致
+function initSelectedAssets2Table(){
+    var inputAssets = $('#id_assets').val();
+    var selectedAssets = asset_table2.selected.concat();
+
+    // input assets无，table assets选中，则取消勾选(再次click)
+    if (selectedAssets.length !== 0){
+        $.each(selectedAssets, function (index, assetId){
+            if ($.inArray(assetId, inputAssets) === -1){
+                $('#'+assetId).trigger('click');  // 取消勾选
+            }
+        });
+    }
+
+    // input assets有，table assets没选，则选中(click)
+    if (inputAssets !== null){
+        asset_table2.selected = inputAssets;
+        $.each(inputAssets, function(index, assetId){
+            var dom = document.getElementById(assetId);
+            if (dom !== null){
+                var selected = dom.parentElement.parentElement.className.indexOf('selected')
+            }
+            if (selected === -1){
+                $('#'+assetId).trigger('click');
+            }
+        });
+    }
+}
+
+
+function rootNodeAddDom(ztree, callback) {
+    var refreshIcon = "<a id='tree-refresh'><i class='fa fa-refresh'></i></a>";
+    var rootNode = ztree.getNodes()[0];
+    var $rootNodeRef = $("#" + rootNode.tId + "_a");
+    $rootNodeRef.after(refreshIcon);
+    var refreshIconRef = $('#tree-refresh');
+    refreshIconRef.bind('click', function () {
+        ztree.destroy();
+        callback()
+    })
 }

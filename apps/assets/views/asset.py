@@ -8,7 +8,8 @@ import codecs
 import chardet
 from io import StringIO
 
-from django.conf import settings
+from django.db import transaction
+from django.contrib import messages
 from django.utils.translation import ugettext_lazy as _
 from django.views.generic import TemplateView, ListView, View
 from django.views.generic.edit import CreateView, DeleteView, FormView, UpdateView
@@ -24,18 +25,18 @@ from django.shortcuts import redirect
 from django.contrib.messages.views import SuccessMessageMixin
 
 from common.mixins import JSONResponseMixin
-from common.utils import get_object_or_none, get_logger, is_uuid
+from common.utils import get_object_or_none, get_logger
+from common.permissions import AdminUserRequiredMixin
 from common.const import create_success_msg, update_success_msg
+from orgs.utils import current_org
 from .. import forms
-from ..models import Asset, AssetGroup, AdminUser, Cluster, SystemUser
-from ..hands import AdminUserRequiredMixin
+from ..models import Asset, AdminUser, SystemUser, Label, Node, Domain
 
 
 __all__ = [
-    'AssetListView', 'AssetCreateView', 'AssetUpdateView',
+    'AssetListView', 'AssetCreateView', 'AssetUpdateView', 'AssetUserListView',
     'UserAssetListView', 'AssetBulkUpdateView', 'AssetDetailView',
-    'AssetModalListView', 'AssetDeleteView', 'AssetExportView',
-    'BulkImportAssetView',
+    'AssetDeleteView', 'AssetExportView', 'BulkImportAssetView',
 ]
 logger = get_logger(__file__)
 
@@ -44,10 +45,26 @@ class AssetListView(AdminUserRequiredMixin, TemplateView):
     template_name = 'assets/asset_list.html'
 
     def get_context_data(self, **kwargs):
+        Node.root()
         context = {
             'app': _('Assets'),
             'action': _('Asset list'),
-            'system_users': SystemUser.objects.all(),
+            'labels': Label.objects.all().order_by('name'),
+            'nodes': Node.objects.all().order_by('-key'),
+        }
+        kwargs.update(context)
+        return super().get_context_data(**kwargs)
+
+
+class AssetUserListView(AdminUserRequiredMixin, DetailView):
+    model = Asset
+    context_object_name = 'asset'
+    template_name = 'assets/asset_asset_user_list.html'
+
+    def get_context_data(self, **kwargs):
+        context = {
+            'app': _('Assets'),
+            'action': _('Asset user list'),
         }
         kwargs.update(context)
         return super().get_context_data(**kwargs)
@@ -58,8 +75,7 @@ class UserAssetListView(LoginRequiredMixin, TemplateView):
 
     def get_context_data(self, **kwargs):
         context = {
-            'app': _('Assets'),
-            'action': _('Asset list'),
+            'action': _('My assets'),
             'system_users': SystemUser.objects.all(),
         }
         kwargs.update(context)
@@ -72,12 +88,15 @@ class AssetCreateView(AdminUserRequiredMixin, SuccessMessageMixin, CreateView):
     template_name = 'assets/asset_create.html'
     success_url = reverse_lazy('assets:asset-list')
 
-    def form_valid(self, form):
-        asset = form.save()
-        asset.created_by = self.request.user.username or 'Admin'
-        asset.date_created = timezone.now()
-        asset.save()
-        return super().form_valid(form)
+    def get_form(self, form_class=None):
+        form = super().get_form(form_class=form_class)
+        node_id = self.request.GET.get("node_id")
+        if node_id:
+            node = get_object_or_none(Node, id=node_id)
+        else:
+            node = Node.root()
+        form["nodes"].initial = node
+        return form
 
     def get_context_data(self, **kwargs):
         context = {
@@ -91,29 +110,12 @@ class AssetCreateView(AdminUserRequiredMixin, SuccessMessageMixin, CreateView):
         return create_success_msg % ({"name": cleaned_data["hostname"]})
 
 
-class AssetModalListView(AdminUserRequiredMixin, ListView):
-    paginate_by = settings.DISPLAY_PER_PAGE
-    model = Asset
-    context_object_name = 'asset_modal_list'
-    template_name = 'assets/asset_modal_list.html'
-
-    def get_context_data(self, **kwargs):
-        assets = Asset.objects.all()
-        assets_id = self.request.GET.get('assets_id', '')
-        assets_id_list = [i for i in assets_id.split(',') if i.isdigit()]
-        context = {
-            'all_assets': assets_id_list,
-            'assets': assets
-        }
-        kwargs.update(context)
-        return super().get_context_data(**kwargs)
-
-
 class AssetBulkUpdateView(AdminUserRequiredMixin, ListView):
     model = Asset
     form_class = forms.AssetBulkUpdateForm
     template_name = 'assets/asset_bulk_update.html'
     success_url = reverse_lazy('assets:asset-list')
+    success_message = _("Bulk update asset success")
     id_list = None
     form = None
 
@@ -135,6 +137,7 @@ class AssetBulkUpdateView(AdminUserRequiredMixin, ListView):
         form = self.form_class(request.POST)
         if form.is_valid():
             form.save()
+            messages.success(request, self.success_message)
             return redirect(self.success_url)
         else:
             return self.get(request, form=form, *args, **kwargs)
@@ -174,27 +177,24 @@ class AssetDeleteView(AdminUserRequiredMixin, DeleteView):
     success_url = reverse_lazy('assets:asset-list')
 
 
-class AssetDetailView(DetailView):
+class AssetDetailView(LoginRequiredMixin, DetailView):
     model = Asset
     context_object_name = 'asset'
     template_name = 'assets/asset_detail.html'
 
     def get_context_data(self, **kwargs):
-        asset_groups = self.object.groups.all()
+        nodes_remain = Node.objects.exclude(assets=self.object)
         context = {
             'app': _('Assets'),
             'action': _('Asset detail'),
-            'asset_groups_remain': [asset_group for asset_group in AssetGroup.objects.all()
-                                    if asset_group not in asset_groups],
-            'asset_groups': asset_groups,
-            'system_users_all': SystemUser.objects.all(),
+            'nodes_remain': nodes_remain,
         }
         kwargs.update(context)
         return super().get_context_data(**kwargs)
 
 
 @method_decorator(csrf_exempt, name='dispatch')
-class AssetExportView(View):
+class AssetExportView(LoginRequiredMixin, View):
     def get(self, request):
         spm = request.GET.get('spm', '')
         assets_id_default = [Asset.objects.first().id] if Asset.objects.first() else []
@@ -202,34 +202,39 @@ class AssetExportView(View):
         fields = [
             field for field in Asset._meta.fields
             if field.name not in [
-                'date_created'
+                'date_created', 'org_id'
             ]
         ]
         filename = 'assets-{}.csv'.format(
-            timezone.localtime(timezone.now()).strftime('%Y-%m-%d_%H-%M-%S'))
+            timezone.localtime(timezone.now()).strftime('%Y-%m-%d_%H-%M-%S')
+        )
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = 'attachment; filename="%s"' % filename
         response.write(codecs.BOM_UTF8)
         assets = Asset.objects.filter(id__in=assets_id)
-        writer = csv.writer(response, dialect='excel',
-                            quoting=csv.QUOTE_MINIMAL)
+        writer = csv.writer(response, dialect='excel', quoting=csv.QUOTE_MINIMAL)
 
         header = [field.verbose_name for field in fields]
-        header.append(_('Asset groups'))
         writer.writerow(header)
 
         for asset in assets:
-            groups = ','.join([group.name for group in asset.groups.all()])
             data = [getattr(asset, field.name) for field in fields]
-            data.append(groups)
             writer.writerow(data)
         return response
 
     def post(self, request, *args, **kwargs):
         try:
             assets_id = json.loads(request.body).get('assets_id', [])
+            node_id = json.loads(request.body).get('node_id', None)
         except ValueError:
             return HttpResponse('Json object not valid', status=400)
+
+        if not assets_id:
+            node = get_object_or_none(Node, id=node_id) if node_id else Node.root()
+            assets = node.get_all_assets()
+            for asset in assets:
+                assets_id.append(asset.id)
+
         spm = uuid.uuid4().hex
         cache.set(spm, assets_id, 300)
         url = reverse_lazy('assets:asset-export') + '?spm=%s' % spm
@@ -240,9 +245,12 @@ class BulkImportAssetView(AdminUserRequiredMixin, JSONResponseMixin, FormView):
     form_class = forms.FileForm
 
     def form_valid(self, form):
+        node_id = self.request.GET.get("node_id")
+        node = get_object_or_none(Node, id=node_id) if node_id else Node.root()
         f = form.cleaned_data['file']
         det_result = chardet.detect(f.read())
         f.seek(0)  # reset file seek index
+
         file_data = f.read().decode(det_result['encoding']).strip(codecs.BOM_UTF8.decode())
         csv_file = StringIO(file_data)
         reader = csv.reader(csv_file)
@@ -255,7 +263,6 @@ class BulkImportAssetView(AdminUserRequiredMixin, JSONResponseMixin, FormView):
         ]
         header_ = csv_data[0]
         mapping_reverse = {field.verbose_name: field.name for field in fields}
-        mapping_reverse[_('Asset groups')] = 'groups'
         attr = [mapping_reverse.get(n, None) for n in header_]
         if None in attr:
             data = {'valid': False,
@@ -269,45 +276,45 @@ class BulkImportAssetView(AdminUserRequiredMixin, JSONResponseMixin, FormView):
             if set(row) == {''}:
                 continue
 
-            asset_dict = dict(zip(attr, row))
-            id_ = asset_dict.pop('id', 0)
-            for k, v in asset_dict.items():
-                if k == 'cluster':
-                    v = get_object_or_none(Cluster, name=v)
-                elif k == 'is_active':
-                    v = bool(v)
+            asset_dict_raw = dict(zip(attr, row))
+            asset_dict = dict()
+            for k, v in asset_dict_raw.items():
+                v = v.strip()
+                if k == 'is_active':
+                    v = False if v in ['False', 0, 'false'] else True
                 elif k == 'admin_user':
                     v = get_object_or_none(AdminUser, name=v)
-                elif k in ['port', 'cabinet_pos', 'cpu_count', 'cpu_cores']:
+                elif k in ['port', 'cpu_count', 'cpu_cores']:
                     try:
                         v = int(v)
                     except ValueError:
-                        v = 0
-                elif k == 'groups':
-                    groups_name = v.split(',')
-                    v = AssetGroup.objects.filter(name__in=groups_name)
-                else:
-                    continue
-                asset_dict[k] = v
+                        v = ''
+                elif k == 'domain':
+                    v = get_object_or_none(Domain, name=v)
+                elif k == 'platform':
+                    v = v.lower().capitalize()
+                if v != '':
+                    asset_dict[k] = v
 
-            asset = get_object_or_none(Asset, id=id_) if is_uuid(id_) else None
+            asset = None
+            asset_id = asset_dict.pop('id', None)
+            if asset_id:
+                asset = get_object_or_none(Asset, id=asset_id)
             if not asset:
                 try:
-                    groups = asset_dict.pop('groups')
                     if len(Asset.objects.filter(hostname=asset_dict.get('hostname'))):
                         raise Exception(_('already exists'))
-                    asset = Asset.objects.create(**asset_dict)
-                    asset.groups.set(groups)
-                    created.append(asset_dict['hostname'])
-                    assets.append(asset)
+                    with transaction.atomic():
+                        asset = Asset.objects.create(**asset_dict)
+                        if node:
+                            asset.nodes.set([node])
+                        created.append(asset_dict['hostname'])
+                        assets.append(asset)
                 except Exception as e:
                     failed.append('%s: %s' % (asset_dict['hostname'], str(e)))
             else:
                 for k, v in asset_dict.items():
-                    if k == 'groups':
-                        asset.groups.set(v)
-                        continue
-                    if v:
+                    if v != '':
                         setattr(asset, k, v)
                 try:
                     asset.save()
